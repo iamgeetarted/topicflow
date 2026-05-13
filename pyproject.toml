@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "topicflow"
-version = "1.0.0"
+version = "1.1.0"
 description = "Async WebSocket pub/sub relay with live Rich dashboard and AI message digest"
 readme = "README.md"
 requires-python = ">=3.11"

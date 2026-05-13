@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable
@@ -30,6 +30,30 @@ class BrokerStats:
     def record_publish(self, topic: str) -> None:
         self.messages_routed += 1
         self.topic_message_counts[topic] = self.topic_message_counts.get(topic, 0) + 1
+
+
+# ---------------------------------------------------------------------------
+# Message History
+# ---------------------------------------------------------------------------
+
+class History:
+    """Per-topic circular buffer of recent message envelopes, for replay."""
+
+    def __init__(self, max_per_topic: int = 100) -> None:
+        self._store: dict[str, deque[dict]] = defaultdict(lambda: deque(maxlen=max_per_topic))
+        self._lock = asyncio.Lock()
+        self.max_per_topic = max_per_topic
+
+    async def record(self, topic: str, envelope: dict) -> None:
+        """Append *envelope* to the history for *topic*."""
+        async with self._lock:
+            self._store[topic].append(envelope)
+
+    async def get(self, topic: str, count: int) -> list[dict]:
+        """Return the last *count* envelopes for *topic* (oldest first)."""
+        async with self._lock:
+            msgs = list(self._store.get(topic, []))
+        return msgs[-count:] if count < len(msgs) else msgs
 
 
 # ---------------------------------------------------------------------------
@@ -89,6 +113,7 @@ async def _handle(
     ws: WebSocket,
     registry: Registry,
     stats: BrokerStats,
+    history: History,
 ) -> None:
     """Handle a single WebSocket connection lifecycle."""
     stats.connections_total += 1
@@ -132,11 +157,20 @@ async def _handle(
                     "id": str(uuid.uuid4())[:8],
                     "ts": datetime.now(timezone.utc).isoformat(),
                 }
+                await history.record(topic, envelope)
                 delivered = await registry.broadcast(topic, envelope)
                 stats.record_publish(topic)
                 await ws.send(
                     json.dumps({"type": "ack", "action": "publish", "topic": topic, "delivered": delivered})
                 )
+
+            elif msg_type == "replay":
+                topic = str(msg.get("topic", "")).strip()
+                count = min(int(msg.get("count", 20)), history.max_per_topic)
+                if not topic:
+                    continue
+                msgs = await history.get(topic, count)
+                await ws.send(json.dumps({"type": "replay", "topic": topic, "messages": msgs, "count": len(msgs)}))
 
             elif msg_type == "topics":
                 info = await registry.topic_info()
@@ -169,6 +203,7 @@ async def _handle(
 async def serve(
     host: str = "0.0.0.0",
     port: int = 8765,
+    history_size: int = 100,
     on_ready: Callable[[str, int], None] | None = None,
 ) -> None:
     """Start the pub/sub broker and run until cancelled.
@@ -176,15 +211,17 @@ async def serve(
     Args:
         host: Interface to bind to.
         port: TCP port to listen on.
+        history_size: Max messages stored per topic for replay (0 to disable).
         on_ready: Optional callback fired once the server is accepting connections.
     """
     import websockets
 
     registry = Registry()
     stats = BrokerStats()
+    history = History(max_per_topic=max(history_size, 0) or 1)
 
     async def _handler(ws: WebSocket) -> None:
-        await _handle(ws, registry, stats)
+        await _handle(ws, registry, stats, history)
 
     async with websockets.serve(_handler, host, port):
         if on_ready:
